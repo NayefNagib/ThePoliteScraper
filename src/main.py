@@ -2,10 +2,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import sleep
 from urllib.parse import urljoin
-
+import json
+import re
+from pydantic import BaseModel, HttpUrl, ValidationError
 import requests
 from bs4 import BeautifulSoup
 
+class BookRecord(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: str | None
+    source_page: HttpUrl
+    fetched_at: str
 
 BASE_URL = "https://books.toscrape.com/"
 FIRST_CATALOGUE_URL = urljoin(BASE_URL, "catalogue/page-1.html")
@@ -17,6 +29,94 @@ USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/NayefNagib)"
 TIMEOUT = 10
 REQUEST_DELAY = 0.5
 
+
+def normalize_price(price_text: str) -> float:
+    """
+    Convert values such as:
+    £51.77
+    Â£51.77
+    into:
+    51.77
+    """
+    cleaned = price_text.replace("Â", "").replace("£", "").strip()
+
+    match = re.search(r"\d+(?:\.\d+)?", cleaned)
+
+    if not match:
+        raise ValueError(f"Invalid price: {price_text}")
+
+    return float(match.group())
+
+def normalize_record(raw_record: dict) -> dict:
+    record = raw_record.copy()
+
+    record["price_text"] = (
+        record["price_text"]
+        .replace("Â", "")
+        .strip()
+    )
+
+    record["price_gbp"] = normalize_price(record["price_text"])
+
+    if record.get("description"):
+        record["description"] = record["description"].strip()
+
+    return record
+
+
+def validate_and_store(raw_records: list[dict]) -> None:
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    valid_records = []
+    errors = []
+
+    seen_urls = set()
+
+    for index, raw_record in enumerate(raw_records, start=1):
+        try:
+            record = normalize_record(raw_record)
+
+            canonical_url = str(record["product_url"])
+
+            # Prevent duplicate records
+            if canonical_url in seen_urls:
+                continue
+
+            seen_urls.add(canonical_url)
+
+            validated = BookRecord.model_validate(record)
+
+            valid_records.append(
+                validated.model_dump(mode="json")
+            )
+
+        except (ValidationError, ValueError, TypeError) as exc:
+            errors.append({
+                "index": index,
+                "record": raw_record,
+                "reason": str(exc),
+            })
+
+    books_path = output_dir / "books.json"
+    errors_path = output_dir / "errors.json"
+
+    books_path.write_text(
+        json.dumps(valid_records, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    errors_path.write_text(
+        json.dumps(errors, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    print()
+    print("VALIDATION COMPLETE")
+    print(f"valid_records={len(valid_records)}")
+    print(f"invalid_records={len(errors)}")
+    print(f"books={books_path}")
+    print(f"errors={errors_path}")
 
 def fetch_page(url: str, cache_file: Path) -> tuple[str, bool]:
     """
@@ -287,3 +387,4 @@ if __name__ == "__main__":
         print()
         print("SAMPLE RAW RECORD:")
         print(records[0])
+        validate_and_store(records)
